@@ -44,26 +44,29 @@ def get_diff(owner: str, repo: str, pull_number: int) -> str:
     return resp.text if resp.status_code == 200 else ""
 
 
-def analyze_code(parsed: List[Any], pr_details: PRDetails) -> List[Dict[str, Any]]:
+def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]]:
     reviews = []
     for pf in parsed:
-        # pf is a PatchedFile
-        for hunk in pf:
-            # Collect AI reviews
+        if not pf.path or pf.path == "/dev/null":
+            continue
+        for hunk in pf.hunks:
             prompt = create_prompt(pf.path, hunk, pr_details)
             ai_reviews = get_ai_response(prompt)
             for r in ai_reviews:
-                # compute absolute position in patch
-                abs_pos = hunk.target_start + int(r['lineNumber']) - 1
+                # calculate file line number and side
+                rel = int(r['lineNumber'])
+                file_line = hunk.target_start + rel - 1
                 reviews.append({
                     'path': pf.path,
-                    'position': abs_pos,
+                    'side': 'RIGHT',
+                    'line': file_line,
                     'body': wrap_body(r),
                     'severity': int(r.get('severity', 0)),
                     'type': r.get('type', 'comment')
                 })
-    # sort & select
+    # sort by severity
     reviews.sort(key=lambda x: x['severity'], reverse=True)
+    # split suggestions and comments
     suggestions = [r for r in reviews if r['type']=='suggestion'][:MAX_SUGGESTIONS]
     comments = [r for r in reviews if r['type']=='comment'][:MAX_COMMENTS]
     chosen = suggestions + comments
@@ -76,7 +79,7 @@ def create_prompt(path: str, hunk: Any, pr: PRDetails) -> str:
     return f"""
 Review PR changes in {path}:
 Provide JSON: {{"reviews":[{{"lineNumber":<relative_line>,"reviewComment":"<text>","severity":<1-5>,"type":"suggestion"|"comment"}}]}}
-- "type": 'suggestion' for fix, 'comment' otherwise
+- 'type': 'suggestion' for fix, 'comment' otherwise
 - Wrap suggestions in ```suggestion``` block
 - Include 'severity'
 
@@ -108,23 +111,25 @@ def wrap_body(r: Dict[str, Any]) -> str:
 
 def create_review_comment(owner: str, repo: str, num: int, reviews: List[Dict[str, Any]]):
     pr = gh.get_repo(f"{owner}/{repo}").get_pull(num)
-    pr.create_review(
-        body="AI Review",
-        comments=[{'path':rv['path'],'position':rv['position'],'body':rv['body']} for rv in reviews],
-        event="COMMENT"
-    )
+    # pass 'path', 'line', 'side', 'body'
+    gh_comments = [{'path': rev['path'], 'line': rev['line'], 'side': rev['side'], 'body': rev['body']} for rev in reviews]
+    pr.create_review(body="AI Review", comments=gh_comments, event="COMMENT")
 
 
 def main():
     pr = get_pr_details()
-    if os.environ.get('GITHUB_EVENT_NAME')!='issue_comment': return
+    if os.environ.get('GITHUB_EVENT_NAME')!='issue_comment':
+        return
     ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
-    if not ev.get('issue',{}).get('pull_request'): return
+    if not ev.get('issue',{}).get('pull_request'):
+        return
     diff = get_diff(pr.owner, pr.repo, pr.pull_number)
     parsed = PatchSet(diff)
     excl = [p.strip() for p in os.environ.get('INPUT_EXCLUDE','').split(',') if p.strip()]
     parsed = [pf for pf in parsed if not any(fnmatch.fnmatch(pf.path, e) for e in excl)]
     reviews = analyze_code(parsed, pr)
-    if reviews: create_review_comment(pr.owner, pr.repo, pr.pull_number, reviews)
+    if reviews:
+        create_review_comment(pr.owner, pr.repo, pr.pull_number, reviews)
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    main()
