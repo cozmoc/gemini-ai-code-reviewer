@@ -1,19 +1,19 @@
 import json
 import os
 from typing import List, Dict, Any
-import re
 import google.generativeai as Client
 from github import Github
 import requests
 import fnmatch
-from unidiff import Hunk, PatchedFile, PatchSet
+from unidiff import Hunk
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-MAX_COMMENTS = 5  # Hard cap on number of suggestions
+MAX_SUGGESTIONS = 3
+MAX_COMMENTS = 2
 
 # Initialize GitHub and Gemini clients
 gh = Github(GITHUB_TOKEN)
-gemini_client = Client.configure(api_key=os.environ.get('GEMINI_API_KEY'))
+Client.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 
 class PRDetails:
     def __init__(self, owner: str, repo: str, pull_number: int, title: str, description: str):
@@ -26,163 +26,134 @@ class PRDetails:
 
 def get_pr_details() -> PRDetails:
     with open(os.environ["GITHUB_EVENT_PATH"], "r") as f:
-        event_data = json.load(f)
-
-    if "issue" in event_data and "pull_request" in event_data["issue"]:
-        pull_number = event_data["issue"]["number"]
-        repo_full_name = event_data["repository"]["full_name"]
+        data = json.load(f)
+    if "issue" in data and data["issue"].get("pull_request"):
+        num = data["issue"]["number"]
     else:
-        pull_number = event_data["number"]
-        repo_full_name = event_data["repository"]["full_name"]
-
-    owner, repo = repo_full_name.split("/")
-    repo_obj = gh.get_repo(repo_full_name)
-    pr = repo_obj.get_pull(pull_number)
-    return PRDetails(owner, repo_obj.name, pull_number, pr.title, pr.body)
+        num = data["number"]
+    full = data["repository"]["full_name"]
+    owner, repo = full.split("/")
+    pr = gh.get_repo(full).get_pull(num)
+    return PRDetails(owner, repo, num, pr.title, pr.body)
 
 
 def get_diff(owner: str, repo: str, pull_number: int) -> str:
-    repo_name = f"{owner}/{repo}"
-    api_url = f"https://api.github.com/repos/{repo_name}/pulls/{pull_number}.diff"
-    headers = {
-        'Authorization': f'Bearer {GITHUB_TOKEN}',
-        'Accept': 'application/vnd.github.v3.diff'
-    }
-    response = requests.get(api_url, headers=headers)
-    return response.text if response.status_code == 200 else ""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}.diff"
+    hdr = {'Authorization': f'Bearer {GITHUB_TOKEN}', 'Accept': 'application/vnd.github.v3.diff'}
+    resp = requests.get(url, headers=hdr)
+    return resp.text if resp.status_code == 200 else ""
 
 
-def analyze_code(parsed_diff: List[Dict[str, Any]], pr_details: PRDetails) -> List[Dict[str, Any]]:
-    comments: List[Dict[str, Any]] = []
-
-    for file_data in parsed_diff:
-        path = file_data.get('path', '')
+def analyze_code(parsed: List[Dict[str, Any]], pr_details: PRDetails) -> List[Dict[str, Any]]:
+    all_reviews = []
+    for f in parsed:
+        path = f.get('path')
         if not path or path == "/dev/null":
             continue
-
-        class FileInfo:
-            def __init__(self, path): self.path = path
-
-        file_info = FileInfo(path)
-        for hdata in file_data.get('hunks', []):
-            lines = hdata.get('lines', [])
-            if not lines: continue
-
-            # Parse hunk header for line mapping
-            header = hdata.get('header', '')
-            m = re.match(r"@@ -\d+(?:,\d+)? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@", header)
-            new_start = int(m.group('new_start')) if m else 1
-            new_len = int(m.group('new_len')) if m and m.group('new_len') else len(lines)
-
+        for h in f.get('hunks', []):
+            lines = h.get('lines', [])
+            if not lines:
+                continue
             hunk = Hunk()
-            hunk.source_start = 1
             hunk.source_length = len(lines)
-            hunk.target_start = new_start
-            hunk.target_length = new_len
             hunk.content = '\n'.join(lines)
+            prompt = create_prompt(path, hunk, pr_details)
+            resp = get_ai_response(prompt)
+            for r in resp:
+                all_reviews.append({
+                    'path': path,
+                    'position': int(r['lineNumber']),
+                    'body': wrap_body(r),
+                    'severity': int(r.get('severity', 0)),
+                    'type': r.get('type', 'comment')
+                })
+    all_reviews.sort(key=lambda x: x['severity'], reverse=True)
+    suggestions = [r for r in all_reviews if r['type'] == 'suggestion'][:MAX_SUGGESTIONS]
+    comments = [r for r in all_reviews if r['type'] == 'comment'][:MAX_COMMENTS]
+    chosen = suggestions + comments
+    chosen.sort(key=lambda x: x['severity'], reverse=True)
+    return chosen
 
-            prompt = create_prompt(file_info, hunk, pr_details)
-            ai_responses = get_ai_response(prompt)
-            comments.extend(create_comment(file_info, hunk, ai_responses))
 
-    # Sort by severity descending and take top N
-    severity_map = lambda c: c.get('severity', 0)
-    sorted_comments = sorted(comments, key=severity_map, reverse=True)
-    return sorted_comments[:MAX_COMMENTS]
+def create_prompt(path: str, hunk: Hunk, pr: PRDetails) -> str:
+    return f'''
+Your task: review this PR diff.
+Instructions:
+- Output JSON: {{"reviews":[{{"lineNumber":<line>,"reviewComment":"<text>","severity":<1-5>,"type":"suggestion" or "comment"}}]}}
+- "type" must be "suggestion" for fixes, "comment" for remarks.
+- Wrap suggestions in ```suggestion``` markdown with replacement code.
+- Use GitHub Markdown.
+- Focus only on real issues.
 
-
-def create_prompt(file: PatchedFile, hunk: Hunk, pr_details: PRDetails) -> str:
-    return f"""Your task is reviewing pull requests. Instructions:
-- Provide response in JSON: {{"reviews":[{{"lineNumber":<line_number>,"reviewComment":"<review comment>","severity":<1-5>}}]}}
-- Only list reviews if issues are found; otherwise "reviews" should be empty.
-- Include "severity" (1=low, 5=critical) for each comment.
-- Use GitHub Markdown and wrap suggestions in ```suggestion``` blocks.
-- Focus on bugs, security, performance.
-- Do NOT suggest code comments.
-
-PR title: {pr_details.title}
+PR title: {pr.title}
 PR description:
 ---
-{pr_details.description or 'No description provided'}
+{pr.description or 'None'}
 ---
 ```diff
 {hunk.content}
-```"""
+```
+'''
 
 
 def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
     model = Client.GenerativeModel(os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash-001'))
-    cfg = {"max_output_tokens":8192, "temperature":0.8, "top_p":0.95}
     try:
-        resp = model.generate_content(prompt, generation_config=cfg)
-        text = resp.text.strip().lstrip('```json').rstrip('```').strip()
-        data = json.loads(text)
-        return [r for r in data.get('reviews', []) if 'lineNumber' in r and 'reviewComment' in r]
+        txt = model.generate_content(prompt, generation_config={"max_output_tokens": 8192}).text
+        txt = txt.strip().lstrip('```json').rstrip('```').strip()
+        return json.loads(txt).get('reviews', [])
     except:
         return []
 
 
-def create_comment(file: Any, hunk: Hunk, ai_responses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    comments = []
-    for r in ai_responses:
-        try:
-            ln = int(r['lineNumber'])
-            # Map to actual position in file
-            position = hunk.target_start + ln - 1
-            if 1 <= ln <= hunk.source_length:
-                body = f"```suggestion
-{r['reviewComment']}
-```"
-                sev = int(r.get('severity', 0))
-                comments.append({'path': file.path, 'position': position, 'body': body, 'severity': sev})
-        except:
-            continue
-    return comments
+def wrap_body(r: Dict[str, Any]) -> str:
+    if r.get('type') == 'suggestion':
+        return f"```suggestion\n{r['reviewComment']}\n```"
+    return r['reviewComment']
 
 
-def create_review_comment(owner: str, repo: str, pr_num: int, comments: List[Dict[str, Any]]):
-    pr = gh.get_repo(f"{owner}/{repo}").get_pull(pr_num)
-    payload = [{k: v for k, v in c.items() if k != 'severity'} for c in comments]
-    pr.create_review(body="AI Review Comments", comments=payload, event="COMMENT")
+def create_review_comment(owner: str, repo: str, num: int, reviews: List[Dict[str, Any]]):
+    pr = gh.get_repo(f"{owner}/{repo}").get_pull(num)
+    pr.create_review(
+        body="AI Review",
+        comments=[{'path': rev['path'], 'position': rev['position'], 'body': rev['body']} for rev in reviews],
+        event="COMMENT"
+    )
 
 
-def parse_diff(diff_str: str) -> List[Dict[str, Any]]:
-    files, current, hunk = [], None, None
-    for line in diff_str.splitlines():
+def parse_diff(diff: str) -> List[Dict[str, Any]]:
+    files, cur, h = [], None, None
+    for line in diff.splitlines():
         if line.startswith('diff --git'):
-            if current: files.append(current)
-            current = {'path': '', 'hunks': []}
-            hunk = None
-        elif line.startswith('--- a/') and current:
-            current['path'] = line[6:]
-        elif line.startswith('+++ b/') and current:
-            current['path'] = line[6:]
-        elif line.startswith('@@') and current:
-            hunk = {'header': line, 'lines': []}
-            current['hunks'].append(hunk)
-        elif hunk is not None:
-            hunk['lines'].append(line)
-    if current: files.append(current)
+            if cur: files.append(cur)
+            cur = {'path': '', 'hunks': []}
+        elif line.startswith('--- a/') and cur:
+            cur['path'] = line[6:]
+        elif line.startswith('+++ b/') and cur:
+            cur['path'] = line[6:]
+        elif line.startswith('@@') and cur:
+            h = {'lines': []}
+            cur['hunks'].append(h)
+        elif h is not None:
+            h['lines'].append(line)
+    if cur: files.append(cur)
     return files
 
 
 def main():
     pr = get_pr_details()
-    event_name = os.environ.get('GITHUB_EVENT_NAME')
-    if event_name != 'issue_comment':
+    if os.environ.get('GITHUB_EVENT_NAME') != 'issue_comment':
         return
-
     data = json.load(open(os.environ['GITHUB_EVENT_PATH']))
     if not data.get('issue', {}).get('pull_request'):
         return
-
     diff = get_diff(pr.owner, pr.repo, pr.pull_number)
     parsed = parse_diff(diff)
     excl = [p.strip() for p in os.environ.get('INPUT_EXCLUDE', '').split(',') if p.strip()]
-    filtered = [f for f in parsed if not any(fnmatch.fnmatch(f['path'], pat) for pat in excl)]
-    comments = analyze_code(filtered, pr)
-    if comments:
-        create_review_comment(pr.owner, pr.repo, pr.pull_number, comments)
+    parsed = [f for f in parsed if not any(fnmatch.fnmatch(f['path'], e) for e in excl)]
+    reviews = analyze_code(parsed, pr)
+    if reviews:
+        create_review_comment(pr.owner, pr.repo, pr.pull_number, reviews)
 
 if __name__ == '__main__':
     main()
