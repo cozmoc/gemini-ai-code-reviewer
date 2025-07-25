@@ -54,14 +54,35 @@ def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
                 prompt,
                 generation_config={"max_output_tokens": 8192}
             )
-            text = result.text.strip()
-            clean = text.lstrip('```json').rstrip('```').strip()
-            payload = json.loads(clean)
-            return payload if isinstance(payload, list) else payload.get('reviews', [])
+            text = result.text or ""
+            if not text.strip():
+                logger.warning(f"Empty response from Gemini API on attempt {attempt}")
+                return []
+
+            clean = text.strip().lstrip('```json').rstrip('```').strip()
+            try:
+                payload = json.loads(clean)
+            except json.JSONDecodeError as je:
+                logger.warning(
+                    f"Could not parse JSON from Gemini API response (attempt {attempt}): {je}\n"
+                    f"Raw response:\n{text!r}"
+                )
+                return []
+
+            if isinstance(payload, list):
+                return payload
+            if isinstance(payload, dict) and 'reviews' in payload:
+                return payload['reviews']
+
+            logger.warning(f"Unexpected payload format from Gemini API: {payload!r}")
+            return []
+
         except Exception as e:
             logger.warning(f"Gemini API error (attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(BACKOFF_FACTOR * (2 ** (attempt - 1)))
+                sleep_time = BACKOFF_FACTOR * (2 ** (attempt - 1))
+                logger.info(f"Retrying after {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
             else:
                 return []
 
@@ -69,7 +90,7 @@ def analyze_code(parsed: List[Any], pr: PRDetails) -> List[Dict[str, Any]]:
     logger.info(f"Analyzing PR #{pr.pull_number} in batches of {HUNK_BATCH_SIZE}")
     SEVERITY_MAP = {"critical": 4, "major": 3, "minor": 2, "info": 1}
 
-    # flatten all hunks
+    # Flatten hunks
     hunks: List[Tuple[str, Any]] = []
     for pf in parsed:
         if not pf.path or pf.path == "/dev/null":
@@ -100,16 +121,18 @@ def analyze_code(parsed: List[Any], pr: PRDetails) -> List[Dict[str, Any]]:
                     continue
 
                 raw_sev = r.get('severity', 0)
-                sev = SEVERITY_MAP.get(str(raw_sev).lower(), 0) if isinstance(raw_sev, str) else int(raw_sev)
+                sev = (
+                    SEVERITY_MAP.get(str(raw_sev).lower(), 0)
+                    if isinstance(raw_sev, str)
+                    else int(raw_sev)
+                )
 
-                # find matching hunk and compute 'position'
+                # Find matching hunk to compute 'position'
                 for pf_path, hunk in batch:
                     if pf_path != path:
                         continue
 
-                    # build flat list of hunk lines
                     diff_lines = [ln for ln in hunk if ln.is_added or ln.is_context]
-
                     position = None
                     for idx, ln in enumerate(diff_lines):
                         if ln.target_line_no == rel_line:
@@ -122,12 +145,14 @@ def analyze_code(parsed: List[Any], pr: PRDetails) -> List[Dict[str, Any]]:
                     reviews.append({
                         'path':     path,
                         'position': position,
-                        'body':     wrap_body({'type': r.get('type','comment'), 'reviewComment': comment_text}),
+                        'body':     wrap_body({
+                                         'type': r.get('type','comment'),
+                                         'reviewComment': comment_text
+                                     }),
                         'severity': sev
                     })
                     break
 
-    # pick top severities
     reviews.sort(key=lambda x: x['severity'], reverse=True)
     suggestions = [r for r in reviews if 'suggestion' in r['body']][:MAX_SUGGESTIONS]
     comments    = [r for r in reviews if 'suggestion' not in r['body']][:MAX_COMMENTS]
