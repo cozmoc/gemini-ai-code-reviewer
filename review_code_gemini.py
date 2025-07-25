@@ -9,6 +9,8 @@ import fnmatch
 from unidiff import Hunk, PatchedFile, PatchSet
 import logging
 import re
+import time
+
 
 # Set up logging at the top
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -99,56 +101,70 @@ def extract_severity(comment_text: str) -> int:
     return 0  # Default lowest severity
 
 
+import math
+
+def chunk_list(lst, chunk_size):
+    """Yield successive chunk_size-sized chunks from lst."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
+
 def analyze_code(parsed_diff: List[Dict[str, Any]], pr_details: PRDetails) -> List[Dict[str, Any]]:
     logging.info("Starting analyze_code...")
     logging.info(f"Number of files to analyze: {len(parsed_diff)}")
 
-    comments = []
+    all_comments = []
 
-    for file_data in parsed_diff:
-        file_path = file_data.get('path', '')
-        logging.info(f"Processing file: {file_path}")
+    for file_chunk in chunk_list(parsed_diff, 5):
+        chunk_comments = []
 
-        if not file_path or file_path == "/dev/null":
-            continue
+        for file_data in file_chunk:
+            file_path = file_data.get('path', '')
+            logging.info(f"Processing file: {file_path}")
 
-        file_info = FileInfo(file_path)
-        hunks = file_data.get('hunks', [])
-        logging.info(f"Hunks in file: {len(hunks)}")
-
-        for hunk_data in hunks:
-            hunk_lines = hunk_data.get('lines', [])
-            logging.info(f"Number of lines in hunk: {len(hunk_lines)}")
-
-            if not hunk_lines:
+            if not file_path or file_path == "/dev/null":
                 continue
 
-            hunk = Hunk()
-            hunk.source_start = 1
-            hunk.source_length = len(hunk_lines)
-            hunk.target_start = 1
-            hunk.target_length = len(hunk_lines)
-            hunk.content = '\n'.join(hunk_lines)
+            file_info = FileInfo(file_path)
+            hunks = file_data.get('hunks', [])
+            logging.info(f"Hunks in file: {len(hunks)}")
 
-            prompt = create_prompt(file_info, hunk, pr_details)
-            logging.info("Sending prompt to Gemini...")
-            ai_response = get_ai_response(prompt)
-            logging.info(f"AI response received: {ai_response}")
+            for hunk_data in hunks:
+                hunk_lines = hunk_data.get('lines', [])
+                if not hunk_lines:
+                    continue
+            
+                hunk = Hunk()
+                hunk.source_start = 1
+                hunk.source_length = len(hunk_lines)
+                hunk.target_start = 1
+                hunk.target_length = len(hunk_lines)
+                hunk.content = '\n'.join(hunk_lines)
+            
+                prompt = create_prompt(file_info, hunk, pr_details)
+                logging.info("Sending prompt to Gemini...")
+            
+                time.sleep(1.5)  # ✅ Throttle to slow down requests
+            
+                ai_response = get_ai_response(prompt)
+                logging.info(f"AI response received: {ai_response}")
+            
 
-            if ai_response:
-                new_comments = create_comment(file_info, hunk, ai_response)
-                logging.info(f"Comments created from AI response: {new_comments}")
-                if new_comments:
-                    comments.extend(new_comments)
-                    logging.info(f"Updated comments list size: {len(comments)}")
+                if ai_response:
+                    new_comments = create_comment(file_info, hunk, ai_response)
+                    logging.info(f"Comments created from AI response: {new_comments}")
+                    if new_comments:
+                        chunk_comments.extend(new_comments)
 
-    # Sort comments by severity descending, then limit to 5
+        all_comments.extend(chunk_comments)
+
+    # Sort comments by severity and limit to 5
     logging.info("Sorting comments by severity...")
-    comments.sort(key=lambda c: extract_severity(c['body']), reverse=True)
-    limited_comments = comments[:5]
+    all_comments.sort(key=lambda c: extract_severity(c['body']), reverse=True)
+    limited_comments = all_comments[:5]
     logging.info(f"Returning top {len(limited_comments)} comments by severity.")
 
     return limited_comments
+
 
 def create_prompt(file: PatchedFile, hunk: Hunk, pr_details: PRDetails) -> str:
     """Creates the prompt for the Gemini model."""
