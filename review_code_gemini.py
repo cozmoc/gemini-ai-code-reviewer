@@ -49,7 +49,7 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
     for pf in parsed:
         if not pf.path or pf.path == "/dev/null":
             continue
-        for hunk in pf.hunks:
+        for hunk in pf:
             prompt = create_prompt(pf.path, hunk, pr_details)
             ai_reviews = get_ai_response(prompt)
             for r in ai_reviews:
