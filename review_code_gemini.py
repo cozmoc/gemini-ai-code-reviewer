@@ -123,12 +123,22 @@ def main():
     ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
     if not ev.get('issue',{}).get('pull_request'):
         return
-    diff = get_diff(pr.owner, pr.repo, pr.pull_number)
-    parsed = PatchSet(diff)
-    excl = [p.strip() for p in os.environ.get('INPUT_EXCLUDE','').split(',') if p.strip()]
-    parsed = [pf for pf in parsed if not any(fnmatch.fnmatch(pf.path, e) for e in excl)]
-    reviews = analyze_code(parsed, pr)
+    # Fetch files directly from the PR to ensure we have the latest patch
+    repo = gh.get_repo(f"{pr.owner}/{pr.repo}")
+    pull = repo.get_pull(pr.pull_number)
+    gh_files = pull.get_files()
+    reviews = []
+    for gh_file in gh_files:
+        if not gh_file.patch:
+            continue
+        # parse only this file's patch
+        parsed = PatchSet(gh_file.patch)
+        parsed = [pf for pf in parsed if pf.path == gh_file.filename]
+        parsed = [pf for pf in parsed if not any(fnmatch.fnmatch(pf.path, pat.strip()) for pat in os.environ.get('INPUT_EXCLUDE','').split(',') if pat.strip())]
+        reviews.extend(analyze_code(parsed, pr))
+    # now post if any
     if reviews:
+        # already sorted and sliced in analyze_code
         create_review_comment(pr.owner, pr.repo, pr.pull_number, reviews)
 
 if __name__=='__main__':
