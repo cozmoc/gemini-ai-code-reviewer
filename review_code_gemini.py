@@ -59,7 +59,13 @@ def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
                 logger.warning(f"Empty response from Gemini API on attempt {attempt}")
                 return []
 
-            clean = text.strip().lstrip('```json').rstrip('```').strip()
+            # Extract only the JSON content
+            clean = text.strip()
+            if clean.startswith("```json"):
+                clean = clean[len("```json"):].strip()
+            if clean.endswith("```"):
+                clean = clean[:-3].strip()
+
             try:
                 payload = json.loads(clean)
             except json.JSONDecodeError as je:
@@ -85,6 +91,7 @@ def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
                 time.sleep(sleep_time)
             else:
                 return []
+
 
 def analyze_code(parsed: List[Any], pr: PRDetails) -> List[Dict[str, Any]]:
     logger.info(f"Analyzing PR #{pr.pull_number} in batches of {HUNK_BATCH_SIZE}")
@@ -163,9 +170,24 @@ def create_batch_prompt(batch: List[Tuple[str, Any]], pr: PRDetails) -> str:
     for path, hunk in batch:
         header = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
         diffs.append(header + "\n".join(hunk.source))
+    
     return f"""
 You are a senior code reviewer.
-Review the following PR hunks and identify critical or subtle issues in logic, edge cases, data handling, and correctness.
+
+Review the following PR hunks and return a JSON array. Each element must be an object like:
+{{
+  "path": "<file path>",
+  "reviews": [
+    {{
+      "line": <line number>,
+      "comment": "<review comment>",
+      "type": "comment" | "suggestion",
+      "severity": "critical" | "major" | "minor" | "info"
+    }}
+  ]
+}}
+
+Respond with **only** valid JSON. Do not include explanations, markdown, or prose.
 
 PR Title: {pr.title}
 PR Description:
