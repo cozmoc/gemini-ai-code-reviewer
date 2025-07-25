@@ -165,7 +165,6 @@ def analyze_code(parsed_diff: List[Dict[str, Any]], pr_details: PRDetails) -> Li
 
     return limited_comments
 
-
 def create_prompt(file: PatchedFile, hunk: Hunk, pr_details: PRDetails) -> str:
     """Creates the prompt for the Gemini model."""
     return f"""You are a senior software engineer reviewing a pull request. Your task is to provide **high-quality, relevant** code review comments.
