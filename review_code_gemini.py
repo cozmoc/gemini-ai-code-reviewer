@@ -157,10 +157,10 @@ def analyze_code(parsed_diff: List[Dict[str, Any]], pr_details: PRDetails) -> Li
 
         all_comments.extend(chunk_comments)
 
-    # Sort comments by severity and limit to 5
+    # Sort comments by severity and limit to 10
     logging.info("Sorting comments by severity...")
     all_comments.sort(key=lambda c: extract_severity(c['body']), reverse=True)
-    limited_comments = all_comments[:5]
+    limited_comments = all_comments[:10]
     logging.info(f"Returning top {len(limited_comments)} comments by severity.")
 
     return limited_comments
