@@ -1,6 +1,6 @@
 import json
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Any as TypingAny
 import google.generativeai as Client
 from github import Github
 import fnmatch
@@ -37,7 +37,7 @@ def get_pr_details() -> PRDetails:
     return PRDetails(owner, repo, num, pr.title, pr.body)
 
 
-def hunk_position_for_target_line(hunk: Any, target_line_number: int) -> int:
+def hunk_position_for_target_line(hunk: TypingAny, target_line_number: int) -> int:
     """
     Given a hunk and an absolute target_line_number (new file),
     return the 0-based diff position for that line within this hunk.
@@ -84,7 +84,7 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
     return chosen
 
 
-def create_prompt(path: str, hunk: Any, pr: PRDetails) -> str:
+def create_prompt(path: str, hunk: TypingAny, pr: PRDetails) -> str:
     content = '\n'.join(hunk.source)
     return f"""
 You are a senior code reviewer.
@@ -96,7 +96,7 @@ Return JSON in the format:
   \"reviews\": [
     {{
       \"lineNumber\": <relative_line>,
-      \"reviewComment\": \"<insightful and actionable comment>\", 
+      \"reviewComment\": \"<insightful and actionable comment>\",
       \"severity\": <1-5>,  // 1=minor, 5=critical
       \"type\": \"suggestion\" | \"comment\"
     }}
@@ -141,13 +141,13 @@ def create_review_comment(owner: str, repo: str, num: int, reviews: List[Dict[st
     pr = repo_obj.get_pull(num)
     head_sha = pr.head.sha
 
-    # Post one inline comment per review
+    # Post one inline comment per review (use positional args)
     for rev in reviews:
         pr.create_review_comment(
-            body=rev['body'],
-            commit_id=head_sha,
-            path=rev['path'],
-            position=rev['position']
+            rev['body'],      # body of the comment
+            head_sha,         # commit SHA
+            rev['path'],      # file path
+            rev['position']   # diff position
         )
 
 
@@ -179,7 +179,7 @@ def main():
         reviews.extend(analyze_code(parsed, pr))
 
     if reviews:
-        create_review_comment(pr.owner, pr.repo, pr.pull_number, reviews)
+        create_review_comment(pr.owner, pr.repository, pr.pull_number, reviews)
 
 
 if __name__=='__main__':
