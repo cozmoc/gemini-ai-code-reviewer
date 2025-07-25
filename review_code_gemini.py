@@ -5,7 +5,6 @@ import time
 from typing import List, Dict, Any, Tuple
 import google.generativeai as Client
 from github import Github
-import requests
 import fnmatch
 from unidiff import PatchSet
 
@@ -164,9 +163,9 @@ PR Description:
 
 def wrap_body(r: Dict[str, Any]) -> str:
     if r.get('type') == 'suggestion':
-        return f"```suggestion
+        return f"""```suggestion
 {r['reviewComment']}
-```"
+```"""
     return r['reviewComment']
 
 
