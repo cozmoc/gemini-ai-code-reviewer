@@ -88,6 +88,7 @@ def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
 def analyze_code(parsed: List[Any], pr_details: PRDetails) -> List[Dict[str, Any]]:
     """
     Analyze code changes in batches of hunks to reduce API calls.
+    Now handles Gemini’s nested 'reviews' arrays by flattening them.
     """
     logger.info(f"Analyzing code for PR: {pr_details.pull_number} in batches of {HUNK_BATCH_SIZE}")
     reviews: List[Dict[str, Any]] = []
@@ -105,29 +106,38 @@ def analyze_code(parsed: List[Any], pr_details: PRDetails) -> List[Dict[str, Any
     for i in range(0, len(hunks), HUNK_BATCH_SIZE):
         batch = hunks[i:i + HUNK_BATCH_SIZE]
         batch_prompt = create_batch_prompt(batch, pr_details)
-        ai_reviews = get_ai_response(batch_prompt)
-        logger.debug(f"Received {len(ai_reviews)} review(s) for batch {i // HUNK_BATCH_SIZE + 1}")
+        ai_responses = get_ai_response(batch_prompt)
 
-        # Match reviews back to each hunk context
-        for r in ai_reviews:
-            try:
-                path = r['path']
-                rel = int(r['lineNumber'])
-                # find the corresponding hunk
+        # Gemini now returns a list of { path, reviews: [ { line, comment, severity, type }, … ] }
+        for file_block in ai_responses:
+            path = file_block.get('path')
+            if not path:
+                logger.warning(f"No path in response block: {file_block}")
+                continue
+
+            for r in file_block.get('reviews', []):
+                # 'line' in the API → our lineNumber
+                rel = int(r.get('line', 0))
+
+                # Find the hunk this review refers to
+                # (we assume the batch ordering matches; adjust if you need more precise matching)
                 for pf_path, hunk in batch:
                     if pf_path == path:
+                        # compute absolute line in the new file
                         file_line = hunk.target_start + rel - 1
+
                         reviews.append({
                             'path': path,
                             'side': 'RIGHT',
                             'line': file_line,
-                            'body': wrap_body(r),
-                            'severity': int(r.get('severity', 0)),
+                            'body': wrap_body({
+                                'type': r.get('type', 'comment'),
+                                'reviewComment': r.get('comment', ''),
+                            }),
+                            'severity': int(r.get('severity', 0) or 0),
                             'type': r.get('type', 'comment')
                         })
                         break
-            except Exception as e:
-                logger.warning(f"Invalid review object: {r} - {e}")
 
     # Select top suggestions and comments
     reviews.sort(key=lambda x: x['severity'], reverse=True)
