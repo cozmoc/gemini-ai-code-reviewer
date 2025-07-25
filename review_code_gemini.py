@@ -67,14 +67,31 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
 def create_prompt(path: str, hunk: Any, pr: PRDetails) -> str:
     content = '\n'.join(hunk.source)
     return f"""
-Review PR changes in {path}:
-Provide JSON: {{"reviews":[{{"lineNumber":<relative_line>,"reviewComment":"<text>","severity":<1-5>,"type":"suggestion"|"comment"}}]}}
-- 'type': 'suggestion' for fix, 'comment' otherwise
-- Wrap suggestions in ```suggestion``` block
-- Include 'severity'
+You are a senior code reviewer.
+Review the PR changes in `{path}` and identify **critical or subtle issues** in logic, state, correctness, edge cases, and data handling.
+Avoid shallow comments like "consider a try-catch" or stylistic nitpicks.
+
+Return JSON in the format:
+{{
+  "reviews": [
+    {{
+      "lineNumber": <relative_line>,
+      "reviewComment": "<insightful and actionable comment>",
+      "severity": <1-5>,  // 1=minor, 5=critical
+      "type": "suggestion" | "comment"
+    }}
+  ]
+}}
+
+Guidelines:
+- Use `"type": "suggestion"` for code changes, `"comment"` for observations.
+- For suggestions, wrap them in a ```suggestion``` code block.
+- Focus on correctness, data integrity, race conditions, edge cases, and non-obvious bugs.
+- Ignore irrelevant concerns like missing logging, try/catch, or formatting.
+- Think like someone who would block a PR for a production-critical bug.
 
 PR Title: {pr.title}
-PR Desc:
+PR Description:
 ---
 {pr.description or 'None'}
 ---
