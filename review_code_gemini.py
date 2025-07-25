@@ -143,7 +143,7 @@ def analyze_code(parsed_diff: List[Dict[str, Any]], pr_details: PRDetails) -> Li
                 prompt = create_prompt(file_info, hunk, pr_details)
                 logging.info("Sending prompt to Gemini...")
             
-                time.sleep(4)  # ✅ Throttle to slow down requests
+                time.sleep(10)  # ✅ Throttle to slow down requests
             
                 ai_response = get_ai_response(prompt)
                 logging.info(f"AI response received: {ai_response}")
@@ -356,7 +356,7 @@ def main():
         parsed_diff = parse_diff(diff)
 
         # Get and clean exclude patterns, handle empty input
-        exclude_patterns_raw = os.environ.get("INPUT_EXCLUDE", "")
+        exclude_patterns_raw = os.environ.get("EXCLUDE", "")
         print(f"Raw exclude patterns: {exclude_patterns_raw}")  # Debug log
         
         # Only split if we have a non-empty string
