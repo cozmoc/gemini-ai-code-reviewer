@@ -179,7 +179,7 @@ def main():
         reviews.extend(analyze_code(parsed, pr))
 
     if reviews:
-        create_review_comment(pr.owner, pr.repository, pr.pull_number, reviews)
+        create_review_comment(pr.owner, pr.repo, pr.pull_number, reviews)
 
 
 if __name__=='__main__':
