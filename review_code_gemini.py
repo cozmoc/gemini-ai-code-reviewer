@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Environment setup
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash-001')
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash-lite-001')
 MAX_SUGGESTIONS = 1
 MAX_COMMENTS = 4
 HUNK_BATCH_SIZE = int(os.environ.get('INPUT_BATCH_SIZE', 5))
@@ -67,7 +67,14 @@ def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
             text = result.text
             clean = text.strip().lstrip('```json').rstrip('```').strip()
             response = json.loads(clean)
-            return response.get('reviews', [])
+
+            if isinstance(response, list):
+                return response
+            elif isinstance(response, dict):
+                return response.get('reviews', [])
+            else:
+                logger.warning("Unexpected response format from Gemini API")
+                return []
         except Exception as e:
             logger.warning(f"Error from Gemini API (attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
@@ -77,7 +84,6 @@ def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
             else:
                 logger.error("Max retries reached. Giving up.")
                 return []
-
 
 def analyze_code(parsed: List[Any], pr_details: PRDetails) -> List[Dict[str, Any]]:
     """
