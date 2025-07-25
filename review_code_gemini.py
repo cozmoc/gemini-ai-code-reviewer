@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import time
 from typing import List, Dict, Any
 import google.generativeai as Client
 from github import Github
@@ -16,6 +17,9 @@ logger = logging.getLogger(__name__)
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 MAX_SUGGESTIONS = 1
 MAX_COMMENTS = 4
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 5))  # number of hunks per batch
+RETRY_LIMIT = int(os.environ.get('RETRY_LIMIT', 3))
+BACKOFF_BASE = float(os.environ.get('BACKOFF_BASE', 1.0))  # seconds
 
 # Initialize clients
 gh = Github(GITHUB_TOKEN)
@@ -52,20 +56,22 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
     logger.info(f"Analyzing code for PR: {pr_details.pull_number}")
     reviews = []
 
+    # Flatten hunks by file
     for pf in parsed:
         if not pf.path or pf.path == "/dev/null":
-            logger.info(f"Skipping deleted or invalid path: {pf.path}")
             continue
-
-        for hunk in pf:
-            prompt = create_prompt(pf.path, hunk, pr_details)
-            logger.debug(f"Sending prompt for {pf.path}")
+        hunks = list(pf)
+        # Batch hunks
+        for i in range(0, len(hunks), BATCH_SIZE):
+            batch = hunks[i : i + BATCH_SIZE]
+            prompt = create_batch_prompt(pf.path, batch, pr_details)
             ai_reviews = get_ai_response(prompt)
-            logger.debug(f"Received {len(ai_reviews)} review(s) from AI")
-
+            # Map reviews back to hunks
             for r in ai_reviews:
                 try:
+                    file_index = int(r.get('hunkIndex', 0))
                     rel = int(r['lineNumber'])
+                    hunk = batch[file_index]
                     file_line = hunk.target_start + rel - 1
                     reviews.append({
                         'path': pf.path,
@@ -78,6 +84,7 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
                 except Exception as e:
                     logger.warning(f"Invalid review object: {r} - {e}")
 
+    # Sort and filter
     reviews.sort(key=lambda x: x['severity'], reverse=True)
     suggestions = [r for r in reviews if r['type'] == 'suggestion'][:MAX_SUGGESTIONS]
     comments = [r for r in reviews if r['type'] == 'comment'][:MAX_COMMENTS]
@@ -88,54 +95,59 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
     return chosen
 
 
-def create_prompt(path: str, hunk: Any, pr: PRDetails) -> str:
-    content = '\n'.join(hunk.source)
+def create_batch_prompt(path: str, hunks: List[Any], pr: PRDetails) -> str:
+    diff_blocks = []
+    for idx, hunk in enumerate(hunks):
+        content = '\n'.join(hunk.source)
+        diff_blocks.append(f"--- Hunk {idx} ---\n```diff\n{content}\n```")
+    blocks = '\n'.join(diff_blocks)
     return f"""
 You are a senior code reviewer.
-Review the PR changes in `{path}` and identify **critical or subtle issues** in logic, state, correctness, edge cases, and data handling.
-Avoid shallow comments like "consider a try-catch" or stylistic nitpicks.
-
-Return JSON in the format:
+Review the PR changes in `{path}`, batch of hunks, and identify **critical or subtle issues**.
+Prepend each review with the corresponding hunk index in field `hunkIndex`.
+Return JSON with:
 {{
   "reviews": [
     {{
+      "hunkIndex": <index>,
       "lineNumber": <relative_line>,
-      "reviewComment": "<insightful and actionable comment>",
-      "severity": <1-5>,  // 1=minor, 5=critical
+      "reviewComment": "<insightful comment>",
+      "severity": <1-5>,
       "type": "suggestion" | "comment"
     }}
   ]
 }}
-
-Guidelines:
-- Use `"type": "suggestion"` for code changes, `"comment"` for observations.
-- For suggestions, wrap them in a ```suggestion``` code block.
-- Focus on correctness, data integrity, race conditions, edge cases, and non-obvious bugs.
-- Ignore irrelevant concerns like missing logging, try/catch, or formatting.
-- Think like someone who would block a PR for a production-critical bug.
 
 PR Title: {pr.title}
 PR Description:
 ---
 {pr.description or 'None'}
 ---
-```diff
-{content}
-```"""
-
+{blocks}"""
 
 
 def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
-    model = Client.GenerativeModel(os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash-001'))
-    try:
-        logger.info("Sending prompt to Gemini API")
-        text = model.generate_content(prompt, generation_config={"max_output_tokens": 8192}).text
-        clean = text.strip().lstrip('```json').rstrip('```').strip()
-        response = json.loads(clean)
-        return response.get('reviews', [])
-    except Exception as e:
-        logger.error(f"Error from Gemini API: {e}")
-        return []
+    model_name = os.environ.get('GEMINI_MODEL', 'gemini-1.0-small')
+    model = Client.GenerativeModel(model_name)
+    for attempt in range(1, RETRY_LIMIT + 1):
+        try:
+            logger.info(f"Sending prompt to Gemini API (attempt {attempt})")
+            text = model.generate_content(
+                prompt,
+                generation_config={"max_output_tokens": 4096}
+            ).text
+            clean = text.strip().lstrip('```json').rstrip('```').strip()
+            response = json.loads(clean)
+            return response.get('reviews', [])
+        except Exception as e:
+            logger.error(f"Error from Gemini API on attempt {attempt}: {e}")
+            if attempt < RETRY_LIMIT:
+                delay = BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.info(f"Retrying after {delay:.1f}s")
+                time.sleep(delay)
+            else:
+                logger.error("Max retries reached, returning empty reviews")
+                return []
 
 
 def wrap_body(r: Dict[str, Any]) -> str:
@@ -160,12 +172,10 @@ def main():
     pr = get_pr_details()
 
     if os.environ.get('GITHUB_EVENT_NAME') != 'issue_comment':
-        logger.info("Not triggered by issue_comment event, exiting.")
         return
 
     ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
     if not ev.get('issue', {}).get('pull_request'):
-        logger.info("No pull_request found in event data, exiting.")
         return
 
     repo = gh.get_repo(f"{pr.owner}/{pr.repo}")
@@ -174,11 +184,9 @@ def main():
 
     reviews = []
     exclude_patterns = [p.strip() for p in os.environ.get('INPUT_EXCLUDE', '').split(',') if p.strip()]
-    logger.info(f"Excluding files matching patterns: {exclude_patterns}")
 
     for gh_file in gh_files:
         if not gh_file.patch:
-            logger.info(f"Skipping file without patch: {gh_file.filename}")
             continue
 
         header = (
@@ -188,8 +196,7 @@ def main():
         )
         try:
             parsed = PatchSet(header + gh_file.patch)
-        except Exception as e:
-            logger.warning(f"Failed to parse patch for {gh_file.filename}: {e}")
+        except Exception:
             continue
 
         parsed = [pf for pf in parsed if pf.path == gh_file.filename]
@@ -199,8 +206,7 @@ def main():
 
     if reviews:
         create_review_comment(pr.owner, pr.repo, pr.pull_number, reviews)
-    else:
-        logger.info("No reviews to post")
+
 
 if __name__ == '__main__':
     main()
