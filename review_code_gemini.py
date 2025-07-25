@@ -45,9 +45,7 @@ def hunk_position_for_target_line(hunk: Any, target_line_number: int) -> int:
     position = 0
     current_target = hunk.target_start
     for line in hunk:
-        # All diff lines count toward position
         if line.is_added or line.is_context or line.is_removed:
-            # Check if this line corresponds to the target file line
             if (line.is_added or line.is_context) and current_target == target_line_number:
                 return position
             position += 1
@@ -67,7 +65,6 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
             for r in ai_reviews:
                 rel = int(r['lineNumber'])
                 file_line = hunk.target_start + rel - 1
-                # compute diff position within this hunk
                 try:
                     position = hunk_position_for_target_line(hunk, file_line)
                 except ValueError:
@@ -79,7 +76,6 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
                     'severity': int(r.get('severity', 0)),
                     'type': r.get('type', 'comment')
                 })
-    # Sort and pick top suggestions/comments
     reviews.sort(key=lambda x: x['severity'], reverse=True)
     suggestions = [r for r in reviews if r['type']=='suggestion'][:MAX_SUGGESTIONS]
     comments = [r for r in reviews if r['type']=='comment'][:MAX_COMMENTS]
@@ -93,22 +89,22 @@ def create_prompt(path: str, hunk: Any, pr: PRDetails) -> str:
     return f"""
 You are a senior code reviewer.
 Review the PR changes in `{path}` and identify **critical or subtle issues** in logic, state, correctness, edge cases, and data handling.
-Avoid shallow comments like "consider a try-catch" or stylistic nitpicks.
+Avoid shallow comments like \"consider a try-catch\" or stylistic nitpicks.
 
 Return JSON in the format:
 {{
-  "reviews": [
+  \"reviews\": [
     {{
-      "lineNumber": <relative_line>,
-      "reviewComment": "<insightful and actionable comment>",
-      "severity": <1-5>,  // 1=minor, 5=critical
-      "type": "suggestion" | "comment"
+      \"lineNumber\": <relative_line>,
+      \"reviewComment\": \"<insightful and actionable comment>\", 
+      \"severity\": <1-5>,  // 1=minor, 5=critical
+      \"type\": \"suggestion\" | \"comment\"
     }}
   ]
 }}
 
 Guidelines:
-- Use "type": "suggestion" for code changes, "comment" for observations.
+- Use \"type\": \"suggestion\" for code changes, \"comment\" for observations.
 - For suggestions, wrap them in a ```suggestion``` code block.
 - Focus on correctness, data integrity, race conditions, edge cases, and non-obvious bugs.
 - Ignore irrelevant concerns like missing logging, try/catch, or formatting.
@@ -145,21 +141,14 @@ def create_review_comment(owner: str, repo: str, num: int, reviews: List[Dict[st
     pr = repo_obj.get_pull(num)
     head_sha = pr.head.sha
 
-    gh_comments = []
+    # Post one inline comment per review
     for rev in reviews:
-        gh_comments.append({
-            'path': rev['path'],
-            'position': rev['position'],
-            'body': rev['body']
-        })
-
-    # Batch create the review
-    pr.create_review(
-        body="AI Review",
-        commit_id=head_sha,
-        comments=gh_comments,
-        event="COMMENT"
-    )
+        pr.create_review_comment(
+            body=rev['body'],
+            commit_id=head_sha,
+            path=rev['path'],
+            position=rev['position']
+        )
 
 
 def main():
