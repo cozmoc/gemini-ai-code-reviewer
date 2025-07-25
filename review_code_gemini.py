@@ -157,10 +157,10 @@ def analyze_code(parsed_diff: List[Dict[str, Any]], pr_details: PRDetails) -> Li
 
         all_comments.extend(chunk_comments)
 
-    # Sort comments by severity and limit to 10
+    # Sort comments by severity and limit to 5
     logging.info("Sorting comments by severity...")
     all_comments.sort(key=lambda c: extract_severity(c['body']), reverse=True)
-    limited_comments = all_comments[:10]
+    limited_comments = all_comments[:5]
     logging.info(f"Returning top {len(limited_comments)} comments by severity.")
 
     return limited_comments
@@ -168,17 +168,31 @@ def analyze_code(parsed_diff: List[Dict[str, Any]], pr_details: PRDetails) -> Li
 
 def create_prompt(file: PatchedFile, hunk: Hunk, pr_details: PRDetails) -> str:
     """Creates the prompt for the Gemini model."""
-    return f"""Your task is reviewing pull requests. Instructions:
-    - Provide the response in following JSON format:  {{"reviews": [{{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}}]}}
-    - Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-    - Use GitHub Markdown in comments
-    - Focus on bugs, security issues, and performance problems
-    - IMPORTANT: NEVER suggest adding comments to the code
+    return f"""You are a senior software engineer reviewing a pull request. Your task is to provide **high-quality, relevant** code review comments.
 
-Review the following code diff in the file "{file.path}" and take the pull request title and description into account when writing the response.
+### Instructions:
+- Only comment if there is a **clear opportunity for improvement** or a **non-trivial issue**. Ignore style, formatting, or unnecessary comments.
+- Prioritize identifying:
+  - Bugs
+  - Security vulnerabilities
+  - Performance issues
+  - Poor handling of edge cases or invalid input
+  - Incorrect assumptions or logic errors
+- **Do NOT suggest adding code comments or docstrings.**
+- Do NOT point out minor naming or formatting issues unless they lead to actual confusion or bugs.
+- If the code is already good, respond with an empty reviews array.
+- Your tone should reflect that of a **thoughtful, experienced engineer** who avoids noise.
+- Before writing a review comment, reason internally whether the issue could realistically affect behavior, security, or performance. If uncertain, err on the side of silence.
 
-Pull request title: {pr_details.title}
-Pull request description:
+### Output Format:
+{{
+  "reviews": [
+    {{
+      "lineNumber": <line_number>,
+      "reviewComment": "<GitHub Markdown formatted comment>"
+    }}
+  ]
+}}
 
 ---
 {pr_details.description or 'No description provided'}
