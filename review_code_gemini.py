@@ -86,85 +86,97 @@ def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
                 return []
 
 def analyze_code(parsed: List[Any], pr_details: PRDetails) -> List[Dict[str, Any]]:
-    """
-    Analyze code changes in batches of hunks to reduce API calls.
-    Now handles Gemini’s nested 'reviews' arrays by flattening them,
-    and maps string severity labels into integers.
-    """
     logger.info(f"Analyzing code for PR: {pr_details.pull_number} in batches of {HUNK_BATCH_SIZE}")
     reviews: List[Dict[str, Any]] = []
 
-    # severity label → numeric mapping
-    SEVERITY_MAP = {
-        "critical": 4,
-        "major":    3,
-        "minor":    2,
-        "info":     1
-    }
+    SEVERITY_MAP = {"critical":4, "major":3, "minor":2, "info":1}
 
-    # Collect all hunks with associated file paths
-    hunks: List[Tuple[str, Any]] = []
-    for pf in parsed:
-        if not pf.path or pf.path == "/dev/null":
-            logger.info(f"Skipping deleted or invalid path: {pf.path}")
-            continue
-        for hunk in pf:
-            hunks.append((pf.path, hunk))
+    # gather hunks…
+    hunks = [(pf.path, hunk) 
+             for pf in parsed 
+             if pf.path and pf.path != "/dev/null" 
+             for hunk in pf]
 
-    # Process in batches
     for i in range(0, len(hunks), HUNK_BATCH_SIZE):
-        batch = hunks[i : i + HUNK_BATCH_SIZE]
-        batch_prompt = create_batch_prompt(batch, pr_details)
-        ai_responses = get_ai_response(batch_prompt)
+        batch = hunks[i:i + HUNK_BATCH_SIZE]
+        ai_responses = get_ai_response(create_batch_prompt(batch, pr_details))
 
-        # Expecting: [{ "path": ..., "reviews": [ { "line": ..., "comment": ..., "severity": ..., "type": ... }, … ] }, …]
+        if not isinstance(ai_responses, list):
+            logger.warning(f"Unexpected top‑level response, expected list: {ai_responses!r}")
+            continue
+
         for file_block in ai_responses:
-            path = file_block.get("path")
-            if not path:
-                logger.warning(f"No path in response block: {file_block}")
+            # 1) Validate file_block format
+            if not isinstance(file_block, dict) or 'path' not in file_block:
+                logger.warning(f"Skipping malformed file_block: {file_block!r}")
+                continue
+            path = file_block['path']
+
+            reviews_list = file_block.get('reviews')
+            if not isinstance(reviews_list, list):
+                logger.warning(f"No reviews array for {path!r}: {file_block!r}")
                 continue
 
-            for r in file_block.get("reviews", []):
-                # Map severity
-                raw = r.get("severity", 0)
-                if isinstance(raw, str):
-                    sev = SEVERITY_MAP.get(raw.lower(), 0)
+            for r in reviews_list:
+                # 2) Validate individual review
+                if not isinstance(r, dict):
+                    logger.warning(f"Skipping non‑dict review for {path!r}: {r!r}")
+                    continue
+                raw_line = r.get('line')
+                raw_comment = r.get('comment')
+                raw_sev = r.get('severity')
+
+                # Must have a comment
+                if not isinstance(raw_comment, str):
+                    logger.warning(f"Skipping review with no string comment: {r!r}")
+                    continue
+
+                # Parse line number
+                try:
+                    rel = int(raw_line)
+                except Exception:
+                    logger.warning(f"Invalid line number {raw_line!r} in review: {r!r}")
+                    continue
+
+                # Parse severity (either int or mapped string)
+                if isinstance(raw_sev, str):
+                    sev = SEVERITY_MAP.get(raw_sev.lower(), 0)
                 else:
                     try:
-                        sev = int(raw)
+                        sev = int(raw_sev)
                     except Exception:
                         sev = 0
 
-                # Relative line within this hunk
-                rel = int(r.get("line", 0))
-
-                # Find matching hunk to compute absolute file line
+                # Find the matching hunk to compute absolute file line
+                matched = False
                 for pf_path, hunk in batch:
                     if pf_path == path:
-                        file_line = hunk.target_start + rel - 1
+                        abs_line = hunk.target_start + rel - 1
                         reviews.append({
-                            "path":     path,
-                            "side":     "RIGHT",
-                            "line":     file_line,
-                            "body":     wrap_body({
-                                "type":           r.get("type", "comment"),
-                                "reviewComment":  r.get("comment", "")
+                            'path':     path,
+                            'side':     'RIGHT',
+                            'line':     abs_line,
+                            'body':     wrap_body({
+                                'type':          r.get('type', 'comment'),
+                                'reviewComment': raw_comment
                             }),
-                            "severity": sev,
-                            "type":     r.get("type", "comment")
+                            'severity': sev,
+                            'type':     r.get('type', 'comment')
                         })
+                        matched = True
                         break
 
-    # Pick top suggestions & comments
-    reviews.sort(key=lambda x: x["severity"], reverse=True)
-    suggestions = [r for r in reviews if r["type"] == "suggestion"][:MAX_SUGGESTIONS]
-    comments    = [r for r in reviews if r["type"] == "comment"][:MAX_COMMENTS]
-    chosen      = suggestions + comments
-    chosen.sort(key=lambda x: x["severity"], reverse=True)
+                if not matched:
+                    logger.warning(f"No matching hunk for review path={path!r}, line={rel}")
+
+    # select top suggestions & comments as before…
+    reviews.sort(key=lambda x: x['severity'], reverse=True)
+    suggestions = [r for r in reviews if r['type']=='suggestion'][:MAX_SUGGESTIONS]
+    comments    = [r for r in reviews if r['type']=='comment']   [:MAX_COMMENTS]
+    chosen      = sorted(suggestions+comments, key=lambda x: x['severity'], reverse=True)
 
     logger.info(f"Returning {len(chosen)} review comments")
     return chosen
-
 
 
 def create_batch_prompt(batch: List[Tuple[str, Any]], pr: PRDetails) -> str:
