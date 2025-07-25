@@ -1,8 +1,9 @@
 import json
 import os
-from typing import List, Dict, Any, Any as TypingAny
+from typing import List, Dict, Any
 import google.generativeai as Client
 from github import Github
+import requests
 import fnmatch
 from unidiff import PatchSet
 
@@ -13,7 +14,6 @@ MAX_COMMENTS = 4
 # Initialize clients
 gh = Github(GITHUB_TOKEN)
 Client.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-
 
 class PRDetails:
     def __init__(self, owner: str, repo: str, pull_number: int, title: str, description: str):
@@ -37,23 +37,6 @@ def get_pr_details() -> PRDetails:
     return PRDetails(owner, repo, num, pr.title, pr.body)
 
 
-def hunk_position_for_target_line(hunk: TypingAny, target_line_number: int) -> int:
-    """
-    Given a hunk and an absolute target_line_number (new file),
-    return the 0-based diff position for that line within this hunk.
-    """
-    position = 0
-    current_target = hunk.target_start
-    for line in hunk:
-        if line.is_added or line.is_context or line.is_removed:
-            if (line.is_added or line.is_context) and current_target == target_line_number:
-                return position
-            position += 1
-            if line.is_added or line.is_context:
-                current_target += 1
-    raise ValueError(f"Line {target_line_number} not found in hunk starting at {hunk.target_start}")
-
-
 def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]]:
     reviews = []
     for pf in parsed:
@@ -65,13 +48,10 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
             for r in ai_reviews:
                 rel = int(r['lineNumber'])
                 file_line = hunk.target_start + rel - 1
-                try:
-                    position = hunk_position_for_target_line(hunk, file_line)
-                except ValueError:
-                    continue
                 reviews.append({
                     'path': pf.path,
-                    'position': position,
+                    'side': 'RIGHT',
+                    'line': file_line,
                     'body': wrap_body(r),
                     'severity': int(r.get('severity', 0)),
                     'type': r.get('type', 'comment')
@@ -84,27 +64,27 @@ def analyze_code(parsed: PatchSet, pr_details: PRDetails) -> List[Dict[str, Any]
     return chosen
 
 
-def create_prompt(path: str, hunk: TypingAny, pr: PRDetails) -> str:
+def create_prompt(path: str, hunk: Any, pr: PRDetails) -> str:
     content = '\n'.join(hunk.source)
     return f"""
 You are a senior code reviewer.
 Review the PR changes in `{path}` and identify **critical or subtle issues** in logic, state, correctness, edge cases, and data handling.
-Avoid shallow comments like \"consider a try-catch\" or stylistic nitpicks.
+Avoid shallow comments like "consider a try-catch" or stylistic nitpicks.
 
 Return JSON in the format:
 {{
-  \"reviews\": [
+  "reviews": [
     {{
-      \"lineNumber\": <relative_line>,
-      \"reviewComment\": \"<insightful and actionable comment>\",
-      \"severity\": <1-5>,  // 1=minor, 5=critical
-      \"type\": \"suggestion\" | \"comment\"
+      "lineNumber": <relative_line>,
+      "reviewComment": "<insightful and actionable comment>",
+      "severity": <1-5>,  // 1=minor, 5=critical
+      "type": "suggestion" | "comment"
     }}
   ]
 }}
 
 Guidelines:
-- Use \"type\": \"suggestion\" for code changes, \"comment\" for observations.
+- Use `"type": "suggestion"` for code changes, `"comment"` for observations.
 - For suggestions, wrap them in a ```suggestion``` code block.
 - Focus on correctness, data integrity, race conditions, edge cases, and non-obvious bugs.
 - Ignore irrelevant concerns like missing logging, try/catch, or formatting.
@@ -126,7 +106,7 @@ def get_ai_response(prompt: str) -> List[Dict[str, Any]]:
         text = model.generate_content(prompt, generation_config={"max_output_tokens":8192}).text
         clean = text.strip().lstrip('```json').rstrip('```').strip()
         return json.loads(clean).get('reviews', [])
-    except Exception:
+    except:
         return []
 
 
@@ -137,18 +117,12 @@ def wrap_body(r: Dict[str, Any]) -> str:
 
 
 def create_review_comment(owner: str, repo: str, num: int, reviews: List[Dict[str, Any]]):
-    repo_obj = gh.get_repo(f"{owner}/{repo}")
-    pr = repo_obj.get_pull(num)
-    head_sha = pr.head.sha
-
-    # Post one inline comment per review (use positional args)
-    for rev in reviews:
-        pr.create_review_comment(
-            rev['body'],      # body of the comment
-            head_sha,         # commit SHA
-            rev['path'],      # file path
-            rev['position']   # diff position
-        )
+    pr = gh.get_repo(f"{owner}/{repo}").get_pull(num)
+    gh_comments = [
+        {'path': rev['path'], 'line': rev['line'], 'side': rev['side'], 'body': rev['body']}
+        for rev in reviews
+    ]
+    pr.create_review(body="AI Review", comments=gh_comments, event="COMMENT")
 
 
 def main():
@@ -168,6 +142,7 @@ def main():
     for gh_file in gh_files:
         if not gh_file.patch:
             continue
+        # Prepend diff headers so PatchSet can parse
         header = (
             f"diff --git a/{gh_file.filename} b/{gh_file.filename}\n"
             f"--- a/{gh_file.filename}\n"
@@ -180,7 +155,6 @@ def main():
 
     if reviews:
         create_review_comment(pr.owner, pr.repo, pr.pull_number, reviews)
-
 
 if __name__=='__main__':
     main()
